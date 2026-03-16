@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "rtpr",
+  "version": "${version}",
+  "name": "RTPR",
+  "description": "Periodically teleports players to random locations across the world, spawning loot chests on arrival with a rare chance of OP gear. Features a countdown timer, combat delay, configurable intervals and radius, boosted mob spawns, and operator commands.",
+  "authors": ["riths"],
+  "contact": {},
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.example.RTPR"],
+    "client": ["com.example.RTPRClient"]
+  },
+  "mixins": ["RTPR.mixins.json"],
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "fabric-api": "*",
+    "minecraft": "~1.21.4"
+  }
+}
