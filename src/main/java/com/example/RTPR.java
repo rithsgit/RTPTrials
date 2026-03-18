@@ -3,13 +3,13 @@ package com.example;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 
 import net.fabricmc.api.ModInitializer;
@@ -31,43 +31,61 @@ public class RTPR implements ModInitializer {
     public static final String MOD_ID = "rtpr";
     public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
-    private static int TELEPORT_INTERVAL = 5;
-    private static int TELEPORT_RADIUS = 100_000;
-    private static final int MAX_TELEPORT_ATTEMPTS = 60;
-    private static final int USED_POSITIONS_CAP = 500;
-    // Countdown is now 10 seconds — the pre-cache fires immediately when the
-    // countdown starts, so there is plenty of time to find a position.
-    private static final int COUNTDOWN_SECONDS = 10;
-    private static final int COMBAT_COOLDOWN_SECONDS = 10;
-    // How often the "teleport coming" reminder flashes on the action bar.
-    private static final int REMINDER_INTERVAL_SECONDS = 30;
-    private static final int MIN_DISTANCE_BETWEEN_TELEPORTS = 2000;
-    // Preferred distance ring from the player's current position.
-    // Candidates inside MIN_PLAYER_DISTANCE are always rejected.
-    // Candidates between MIN_PLAYER_DISTANCE and MAX_PLAYER_DISTANCE are preferred.
-    // Candidates beyond MAX_PLAYER_DISTANCE are accepted as a fallback.
-    private static final int MIN_PLAYER_DISTANCE = 500;
-    private static final int MAX_PLAYER_DISTANCE = 1000;
-    // Minimum distance from world origin (0, 0) — keeps players away from spawn.
-    private static final int MIN_ORIGIN_DISTANCE = 250;
-    private static boolean enabled = true;
+    // ---------------------------------------------------------------------------
+    // Config — all tunable values live here. Wire Config.reload() to a TOML file.
+    // ---------------------------------------------------------------------------
+    public static final class Config {
+        public static int teleportIntervalMinutes     = 5;
+        public static int teleportRadius              = 100_000;
+        public static int maxTeleportAttempts         = 60;
+        public static int usedPositionsCap            = 500;
+        public static int countdownSeconds            = 10;
+        public static int combatCooldownSeconds       = 10;
+        public static int reminderIntervalSeconds     = 30;
+        public static int minDistanceBetweenTeleports = 2_000;
+        public static int minPlayerDistance           = 500;
+        public static int maxPlayerDistance           = 1_000;
+        public static int minOriginDistance           = 250;
+        public static int opChestChance               = 20;
+        // Spawn cap bonuses (also referenced by RTPRServer)
+        public static int monsterSpawnBonus           = 10;
+        public static int passiveSpawnBonus           = 2;
 
-    // Pool needs enough threads to handle 11 scheduled tasks per player simultaneously
-    // (one per second of the countdown). 8 is a reasonable ceiling for a typical server.
-    private static final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(8);
+        public static void reload() {
+            // Stub — replace with your config library (e.g. Cloth Config / simple TOML).
+            // Example: teleportIntervalMinutes = myConfig.getInt("teleportInterval", 5);
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Scheduler — pool sized to handle countdown tasks for a typical server load.
+    // ---------------------------------------------------------------------------
+    private static final ScheduledExecutorService scheduler =
+            Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors() * 2);
+
     private static ScheduledFuture<?> scheduledTask = null;
-    private static ScheduledFuture<?> reminderTask = null;
-    private static MinecraftServer serverInstance = null;
-    // Stores both the cached position and the dimension it was found in,
-    // so doTeleport() can detect if the player changed dimension mid-countdown.
-    private record CachedPosition(BlockPos pos, ResourceKey<net.minecraft.world.level.Level> dimension) {}
-    private static final ConcurrentHashMap<UUID, CachedPosition> preCachedPositions = new ConcurrentHashMap<>();
+    private static ScheduledFuture<?> reminderTask  = null;
+    private static MinecraftServer    serverInstance = null;
+    private static boolean            enabled        = true;
 
-    // Ordered eviction log — lets us reliably drop the oldest entry when the cap is hit.
-    private static final java.util.Deque<BlockPos> usedPositionsOrder =
-        new java.util.concurrent.ConcurrentLinkedDeque<>();
-    private static final Set<BlockPos> usedPositions = ConcurrentHashMap.newKeySet();
+    // ---------------------------------------------------------------------------
+    // Per-player cached positions — cleaned up on disconnect.
+    // ---------------------------------------------------------------------------
+    private record CachedPosition(
+            BlockPos pos,
+            ResourceKey<net.minecraft.world.level.Level> dimension) {}
 
+    private static final ConcurrentHashMap<UUID, CachedPosition> preCachedPositions =
+            new ConcurrentHashMap<>();
+
+    // ---------------------------------------------------------------------------
+    // Position history
+    // ---------------------------------------------------------------------------
+    private static final PositionHistory usedPositions = new PositionHistory(Config.usedPositionsCap);
+
+    // ---------------------------------------------------------------------------
+    // Loot tables
+    // ---------------------------------------------------------------------------
     private static final ResourceLocation[] LOOT_TABLES = {
         ResourceLocation.withDefaultNamespace("chests/abandoned_mineshaft"),
         ResourceLocation.withDefaultNamespace("chests/desert_pyramid"),
@@ -80,18 +98,13 @@ public class RTPR implements ModInitializer {
         ResourceLocation.withDefaultNamespace("chests/shipwreck_treasure")
     };
 
-    // OP loot tables used on the rare 1-in-20 roll.
     private static final ResourceLocation[] OP_LOOT_TABLES = {
-        ResourceLocation.withDefaultNamespace("chests/end_city_treasure"),      // elytra, diamond gear
-        ResourceLocation.withDefaultNamespace("chests/stronghold_library"),     // max enchant books
-        ResourceLocation.withDefaultNamespace("chests/bastion_treasure"),       // netherite, ancient debris
-        ResourceLocation.withDefaultNamespace("chests/woodland_mansion"),       // totem, golden apple
-        ResourceLocation.withDefaultNamespace("chests/buried_treasure")         // heart of the sea, diamonds
+        ResourceLocation.withDefaultNamespace("chests/end_city_treasure")
     };
 
-    // 1-in-20 chance of an OP chest spawning instead of a normal one.
-    private static final int OP_CHEST_CHANCE = 20;
-
+    // ---------------------------------------------------------------------------
+    // ModInitializer
+    // ---------------------------------------------------------------------------
     @Override
     public void onInitialize() {
         LOGGER.info("RTPR mod initialized!");
@@ -99,459 +112,29 @@ public class RTPR implements ModInitializer {
         RTPRCommands.register();
     }
 
-    public static ScheduledExecutorService getScheduler() {
-        return scheduler;
-    }
+    // ---------------------------------------------------------------------------
+    // Accessors used by RTPRCommands / RTPRServer
+    // ---------------------------------------------------------------------------
+    public static ScheduledExecutorService getScheduler()        { return scheduler;                      }
+    public static MinecraftServer          getServer()           { return serverInstance;                 }
+    public static int                      getTeleportInterval() { return Config.teleportIntervalMinutes; }
+    public static ScheduledFuture<?>       getScheduledTask()    { return scheduledTask;                  }
 
-    public static MinecraftServer getServer() {
-        return serverInstance;
-    }
-
-    public static int getTeleportInterval() {
-        return TELEPORT_INTERVAL;
-    }
-
-    public static ScheduledFuture<?> getScheduledTask() {
-        return scheduledTask;
-    }
-
+    // ---------------------------------------------------------------------------
+    // Server lifecycle
+    // ---------------------------------------------------------------------------
     public static void serverStarted(MinecraftServer server) {
         serverInstance = server;
+        Config.reload();
         LOGGER.info("RTPR server started, scheduling teleports.");
         RTPRServer.applySpawnRates(server);
         scheduleRandomTeleport(server);
     }
 
-    public static void scheduleRandomTeleport(MinecraftServer server) {
-        if (scheduledTask != null && !scheduledTask.isCancelled()) {
-            scheduledTask.cancel(false);
-        }
-        if (reminderTask != null && !reminderTask.isCancelled()) {
-            reminderTask.cancel(false);
-        }
-
-        long intervalSeconds = TELEPORT_INTERVAL * 60L;
-        // Clamp the initial delay so it never goes negative if the interval is very short.
-        long initialDelay = Math.max(0, intervalSeconds - COUNTDOWN_SECONDS);
-
-        // Track when the next teleport will fire so reminders can show accurate time remaining.
-        final AtomicLong nextTeleportAt = new AtomicLong(System.currentTimeMillis() + initialDelay * 1000L);
-
-        scheduledTask = scheduler.scheduleAtFixedRate(() -> {
-            if (!enabled) return;
-            if (server == null) {
-                LOGGER.warn("MinecraftServer instance is null.");
-                return;
-            }
-            // Update the next-fire timestamp for the following interval.
-            nextTeleportAt.set(System.currentTimeMillis() + intervalSeconds * 1000L);
-            LOGGER.info("Starting countdown for all players.");
-            server.getPlayerList().getPlayers().forEach(player -> {
-                startCountdown(server, player, COUNTDOWN_SECONDS);
-            });
-        }, initialDelay, intervalSeconds, TimeUnit.SECONDS);
-
-        // Reminder: flash the action bar every REMINDER_INTERVAL_SECONDS showing time until teleport.
-        // Stops firing once the 10-second countdown is active (within COUNTDOWN_SECONDS of the event).
-        reminderTask = scheduler.scheduleAtFixedRate(() -> {
-            if (!enabled) return;
-            if (server == null) return;
-
-            long secsUntil = Math.max(0, (nextTeleportAt.get() - System.currentTimeMillis()) / 1000L);
-            // Don't show the reminder if the 10s countdown is already running.
-            if (secsUntil <= COUNTDOWN_SECONDS) return;
-
-            String timeStr = secsUntil >= 60
-                ? (secsUntil / 60) + "m " + (secsUntil % 60) + "s"
-                : secsUntil + "s";
-
-            server.execute(() -> {
-                server.getPlayerList().getPlayers().forEach(player -> {
-                    GameType gameMode = player.gameMode.getGameModeForPlayer();
-                    if (gameMode == GameType.SPECTATOR || gameMode == GameType.CREATIVE) return;
-
-                    player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetActionBarTextPacket(
-                        Component.literal("Next teleport in " + timeStr).withStyle(ChatFormatting.GRAY)
-                    ));
-                });
-            });
-        }, REMINDER_INTERVAL_SECONDS, REMINDER_INTERVAL_SECONDS, TimeUnit.SECONDS);
-    }
-
-    public static void startCountdown(MinecraftServer server, ServerPlayer player, int seconds) {
-        // Pre-calculate position immediately at start of countdown.
-        // With a 10-second window this is still plenty of time.
-        // Note: if the player changes dimension before the teleport fires,
-        // doTeleport() will discard the cached position and find a fresh one.
-        scheduler.execute(() -> {
-            ServerLevel world = player.serverLevel();
-            if (world == null) return;
-            BlockPos playerPos = player.blockPosition();
-            BlockPos pos = findSafeRandomPosition(world, playerPos);
-            preCachedPositions.put(player.getUUID(), new CachedPosition(pos, world.dimension()));
-            LOGGER.info("Pre-cached teleport position for {}: {}", player.getName().getString(), pos);
-        });
-
-        for (int i = seconds; i >= 0; i--) {
-            final int timeLeft = i;
-            scheduler.schedule(() -> {
-                server.execute(() -> {
-                    if (!player.isAlive()) return;
-
-                    GameType gameMode = player.gameMode.getGameModeForPlayer();
-                    if (gameMode == GameType.SPECTATOR || gameMode == GameType.CREATIVE) return;
-
-                    if (timeLeft == 0) {
-                        doTeleport(server, player);
-                    } else {
-                        // Show subtitle for every tick of the 10-second countdown.
-                        // Red for the last 3 seconds, yellow otherwise.
-                        player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetTitleTextPacket(
-                            Component.literal(" ")
-                        ));
-                        player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetSubtitleTextPacket(
-                            Component.literal("Teleporting in " + timeLeft + "s")
-                                .withStyle(timeLeft <= 3 ? ChatFormatting.RED : ChatFormatting.YELLOW)
-                        ));
-                        player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetTitlesAnimationPacket(0, 25, 5));
-
-                        // Play a pling sound on each of the final 3 ticks.
-                        if (timeLeft <= 3) {
-                            player.connection.send(new net.minecraft.network.protocol.game.ClientboundSoundPacket(
-                                net.minecraft.core.Holder.direct(net.minecraft.sounds.SoundEvents.NOTE_BLOCK_PLING.value()),
-                                net.minecraft.sounds.SoundSource.MASTER,
-                                player.getX(), player.getY(), player.getZ(),
-                                1.0f, 1.5f, player.level().random.nextLong()
-                            ));
-                        }
-                    }
-                });
-            }, (long)(seconds - i), TimeUnit.SECONDS);
-        }
-    }
-
-    private static boolean isInCombat(ServerPlayer player) {
-        return (player.level().getGameTime() - player.getLastHurtByMobTimestamp()) < (COMBAT_COOLDOWN_SECONDS * 20L);
-    }
-
-    public static void doTeleport(MinecraftServer server, ServerPlayer player) {
-        ServerLevel world = player.serverLevel();
-        if (world == null) {
-            LOGGER.warn("Player's world is null, cannot teleport.");
-            return;
-        }
-
-        // Peek first — only remove once we're certain we're going to use it.
-        // If combat delays the teleport we re-enter doTeleport later and the
-        // cached position must still be available.
-        CachedPosition cached = preCachedPositions.get(player.getUUID());
-
-        // Discard the cached position if the player changed dimension during the
-        // countdown — it was found for a different world and is no longer valid.
-        if (cached != null && !cached.dimension().equals(world.dimension())) {
-            LOGGER.info("Player {} changed dimension during countdown, discarding cached position.",
-                player.getName().getString());
-            preCachedPositions.remove(player.getUUID());
-            cached = null;
-        }
-
-        if (isInCombat(player)) {
-            LOGGER.info("Player {} is in combat, delaying teleport by {}s.",
-                player.getName().getString(), COMBAT_COOLDOWN_SECONDS);
-            player.sendSystemMessage(Component.literal(
-                "Teleport delayed — you are in combat!")
-                .withStyle(ChatFormatting.RED));
-            scheduler.schedule(() -> {
-                server.execute(() -> doTeleport(server, player));
-            }, COMBAT_COOLDOWN_SECONDS, TimeUnit.SECONDS);
-            return;
-        }
-
-        // Safe to consume the cache now.
-        if (cached != null) preCachedPositions.remove(player.getUUID());
-
-        if (cached != null) {
-            LOGGER.info("Using pre-cached position for {}: {}", player.getName().getString(), cached.pos());
-            executeTeleport(world, player, cached.pos());
-        } else {
-            player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetTitleTextPacket(
-                Component.literal(" ")
-            ));
-            player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetSubtitleTextPacket(
-                Component.literal("Searching for location...")
-                    .withStyle(ChatFormatting.GRAY)
-            ));
-            player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetTitlesAnimationPacket(0, 60, 10));
-
-            scheduler.execute(() -> {
-                try {
-                    BlockPos playerPos = player.blockPosition();
-                    BlockPos fallbackPos = findSafeRandomPosition(world, playerPos);
-                    server.execute(() -> executeTeleport(world, player, fallbackPos));
-                } catch (Exception e) {
-                    LOGGER.error("Failed to find teleport position: ", e);
-                }
-            });
-        }
-    }
-
-    /** Shared teleport execution — used by both the cached and fallback paths. */
-    private static void executeTeleport(ServerLevel world, ServerPlayer player, BlockPos pos) {
-        try {
-            player.teleportTo(world, pos.getX(), pos.getY(), pos.getZ(),
-                    java.util.Set.of(), player.getYRot(), player.getXRot(), true);
-            player.sendSystemMessage(Component.literal("You have been randomly teleported!")
-                    .withStyle(ChatFormatting.GREEN));
-            player.connection.send(new net.minecraft.network.protocol.game.ClientboundClearTitlesPacket(true));
-            player.connection.send(new net.minecraft.network.protocol.game.ClientboundSoundPacket(
-                net.minecraft.core.Holder.direct(net.minecraft.sounds.SoundEvents.ENDERMAN_TELEPORT),
-                net.minecraft.sounds.SoundSource.MASTER,
-                pos.getX(), pos.getY(), pos.getZ(),
-                1.0f, 1.0f, java.util.concurrent.ThreadLocalRandom.current().nextLong()
-            ));
-            spawnLootChest(world, pos, player);
-            LOGGER.info("Teleported {} to {}", player.getName().getString(), pos);
-        } catch (Exception e) {
-            LOGGER.error("An error occurred during teleportation: ", e);
-            player.sendSystemMessage(Component.literal("Teleportation failed. See server logs.")
-                    .withStyle(ChatFormatting.RED));
-        }
-    }
-
-    private static void spawnLootChest(ServerLevel world, BlockPos playerPos, ServerPlayer player) {
-        try {
-            java.util.concurrent.ThreadLocalRandom rng = java.util.concurrent.ThreadLocalRandom.current();
-            boolean isOp = rng.nextInt(OP_CHEST_CHANCE) == 0;
-
-            ResourceLocation[] pool = isOp ? OP_LOOT_TABLES : LOOT_TABLES;
-            ResourceLocation lootTable = pool[rng.nextInt(pool.length)];
-
-            // Use a trapped chest for OP drops so players can tell at a glance.
-            net.minecraft.world.level.block.state.BlockState chestBlock = isOp
-                ? Blocks.TRAPPED_CHEST.defaultBlockState()
-                : Blocks.CHEST.defaultBlockState();
-
-            BlockPos chestPos = findChestPlacement(world, playerPos);
-            world.setBlock(chestPos, chestBlock, 3);
-
-            if (world.getBlockEntity(chestPos) instanceof RandomizableContainerBlockEntity chest) {
-                ResourceKey<net.minecraft.world.level.storage.loot.LootTable> key =
-                    ResourceKey.create(Registries.LOOT_TABLE, lootTable);
-                chest.setLootTable(key, rng.nextLong());
-                LOGGER.info("Spawned {} chest at {} with loot table {}",
-                    isOp ? "OP" : "normal", chestPos, lootTable);
-            }
-
-            if (isOp) {
-                player.sendSystemMessage(Component.literal("✦ You got lucky — an OP chest spawned!")
-                    .withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD));
-            }
-        } catch (Exception e) {
-            LOGGER.error("Failed to spawn loot chest: ", e);
-        }
-    }
-
-    /**
-     * Finds a safe adjacent block to place the loot chest next to the player.
-     * Tries the four cardinal horizontal neighbours first; falls back to directly
-     * above if all are occupied.
-     */
-    private static BlockPos findChestPlacement(ServerLevel world, BlockPos playerPos) {
-        BlockPos[] candidates = {
-            playerPos.north(),
-            playerPos.south(),
-            playerPos.east(),
-            playerPos.west()
-        };
-        for (BlockPos candidate : candidates) {
-            if (world.getBlockState(candidate).isAir()) {
-                return candidate;
-            }
-        }
-        // Last resort — above the player (original behaviour).
-        return playerPos.above();
-    }
-
-    private static BlockPos findSafeRandomPosition(ServerLevel world, BlockPos playerPos) {
-        final long maxCoord = TELEPORT_RADIUS; // long to prevent overflow in arithmetic below
-
-        final boolean isNether = world.dimension().equals(net.minecraft.world.level.Level.NETHER);
-        final boolean isEnd    = world.dimension().equals(net.minecraft.world.level.Level.END);
-
-        LOGGER.info("Finding teleport position in {} (radius {})", world.dimension().location(), maxCoord);
-
-        final long minDistSq       = (long) MIN_DISTANCE_BETWEEN_TELEPORTS * (long) MIN_DISTANCE_BETWEEN_TELEPORTS;
-        final long minOriginDistSq = (long) MIN_ORIGIN_DISTANCE   * (long) MIN_ORIGIN_DISTANCE;
-        final long minPlayerDistSq = (long) MIN_PLAYER_DISTANCE   * (long) MIN_PLAYER_DISTANCE;
-        final java.util.concurrent.ThreadLocalRandom rng = java.util.concurrent.ThreadLocalRandom.current();
-
-        // Three-pass strategy:
-        //   Pass 0 — preferred ring: 500–1000 blocks from the player (most teleports land here).
-        //   Pass 1 — mid range: 1000–5000 blocks from the player, still avoids repeat locations.
-        //   Pass 2 — full world radius: anywhere outside MIN_PLAYER_DISTANCE, ignores used-position
-        //            history (last resort before the fallback retry).
-        final int PASS_PREFERRED_BUDGET = MAX_TELEPORT_ATTEMPTS * 2;
-        final int PASS_MID_BUDGET       = MAX_TELEPORT_ATTEMPTS;
-        final int PASS_FULL_BUDGET      = MAX_TELEPORT_ATTEMPTS;
-
-        for (int pass = 0; pass < 3; pass++) {
-            int budget = (pass == 0) ? PASS_PREFERRED_BUDGET
-                       : (pass == 1) ? PASS_MID_BUDGET
-                       :               PASS_FULL_BUDGET;
-
-            for (int i = 0; i < budget; i++) {
-                final long x, z;
-
-                if (pass == 0) {
-                    // Uniform sample within the 500–1000 block ring around the player.
-                    double angle = rng.nextDouble() * 2 * Math.PI;
-                    double dist  = MIN_PLAYER_DISTANCE
-                                 + rng.nextDouble() * (MAX_PLAYER_DISTANCE - MIN_PLAYER_DISTANCE);
-                    x = Math.max(-maxCoord, Math.min(maxCoord,
-                            (long)(playerPos.getX() + dist * Math.cos(angle))));
-                    z = Math.max(-maxCoord, Math.min(maxCoord,
-                            (long)(playerPos.getZ() + dist * Math.sin(angle))));
-                } else if (pass == 1) {
-                    // Uniform sample within a 1000–5000 block ring around the player.
-                    double angle = rng.nextDouble() * 2 * Math.PI;
-                    double dist  = MAX_PLAYER_DISTANCE
-                                 + rng.nextDouble() * (5_000 - MAX_PLAYER_DISTANCE);
-                    x = Math.max(-maxCoord, Math.min(maxCoord,
-                            (long)(playerPos.getX() + dist * Math.cos(angle))));
-                    z = Math.max(-maxCoord, Math.min(maxCoord,
-                            (long)(playerPos.getZ() + dist * Math.sin(angle))));
-                } else {
-                    // Uniform sample across the full world radius using angle+distance
-                    // to avoid the square-corner bias of a flat nextInt approach.
-                    double angle = rng.nextDouble() * 2 * Math.PI;
-                    double dist  = MIN_PLAYER_DISTANCE
-                                 + rng.nextDouble() * (maxCoord - MIN_PLAYER_DISTANCE);
-                    x = Math.max(-maxCoord, Math.min(maxCoord,
-                            (long)(playerPos.getX() + dist * Math.cos(angle))));
-                    z = Math.max(-maxCoord, Math.min(maxCoord,
-                            (long)(playerPos.getZ() + dist * Math.sin(angle))));
-                }
-
-                BlockPos pos = resolveToSurface(world, (int) x, (int) z, isNether, isEnd);
-                if (pos == null) continue;
-
-                // Origin exclusion zone.
-                long ox = pos.getX(), oz = pos.getZ();
-                if (ox * ox + oz * oz < minOriginDistSq) continue;
-
-                // Must be far enough from the player's current position.
-                long pdx = pos.getX() - playerPos.getX();
-                long pdz = pos.getZ() - playerPos.getZ();
-                if (pdx * pdx + pdz * pdz < minPlayerDistSq) continue;
-
-                // Pass 2 skips the used-position check — we just need somewhere valid.
-                if (pass < 2) {
-                    boolean tooClose = false;
-                    for (BlockPos used : usedPositions) {
-                        long dx = pos.getX() - used.getX();
-                        long dz = pos.getZ() - used.getZ();
-                        if (dx * dx + dz * dz < minDistSq) {
-                            tooClose = true;
-                            break;
-                        }
-                    }
-                    if (tooClose) continue;
-                }
-
-                recordUsedPosition(pos);
-                LOGGER.info("Found position (pass {}) for player at {}: {}", pass, playerPos, pos);
-                return pos;
-            }
-        }
-
-        // All three passes exhausted — clear history so the world opens back up,
-        // then do one final sweep across the preferred ring followed by the full radius.
-        LOGGER.warn("All passes exhausted, clearing position history and doing final sweep.");
-        usedPositions.clear();
-        usedPositionsOrder.clear();
-
-        for (int i = 0; i < MAX_TELEPORT_ATTEMPTS * 2; i++) {
-            double angle = rng.nextDouble() * 2 * Math.PI;
-            // First half of attempts stays in the preferred ring; second half goes wide.
-            double dist = (i < MAX_TELEPORT_ATTEMPTS)
-                ? MIN_PLAYER_DISTANCE + rng.nextDouble() * (MAX_PLAYER_DISTANCE - MIN_PLAYER_DISTANCE)
-                : MIN_PLAYER_DISTANCE + rng.nextDouble() * (maxCoord - MIN_PLAYER_DISTANCE);
-
-            long cx = Math.max(-maxCoord, Math.min(maxCoord, (long)(playerPos.getX() + dist * Math.cos(angle))));
-            long cz = Math.max(-maxCoord, Math.min(maxCoord, (long)(playerPos.getZ() + dist * Math.sin(angle))));
-
-            long ox = cx, oz = cz;
-            if (ox * ox + oz * oz < minOriginDistSq) continue;
-            long pdx = cx - playerPos.getX(), pdz = cz - playerPos.getZ();
-            if (pdx * pdx + pdz * pdz < minPlayerDistSq) continue;
-
-            BlockPos pos = resolveToSurface(world, (int) cx, (int) cz, isNether, isEnd);
-            if (pos == null) continue;
-
-            LOGGER.warn("Final sweep found position: {}", pos);
-            return pos;
-        }
-
-        // Absolute last resort — guaranteed outside both exclusion zones.
-        LOGGER.error("All position search attempts failed, using minimum-offset fallback.");
-        if (isNether) {
-            return new BlockPos(playerPos.getX() + MIN_PLAYER_DISTANCE, 64, playerPos.getZ());
-        } else {
-            int fx = (int) Math.min(maxCoord, (long) playerPos.getX() + MIN_PLAYER_DISTANCE);
-            int fz = playerPos.getZ();
-            int y  = world.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, fx, fz);
-            return new BlockPos(fx, Math.max(y, 1), fz);
-        }
-    }
-
-    /**
-     * Resolves an (x, z) coordinate to a safe standing position for the given dimension.
-     * Returns null if no safe position can be found at that column.
-     */
-    private static BlockPos resolveToSurface(ServerLevel world, int x, int z,
-                                              boolean isNether, boolean isEnd) {
-        if (isNether) {
-            // Only query block states in loaded chunks to stay thread-safe.
-            if (!world.hasChunk(x >> 4, z >> 4)) return null;
-            for (int y = 30; y < 110; y++) {
-                BlockPos c = new BlockPos(x, y, z);
-                if (world.getBlockState(c).isAir()
-                        && world.getBlockState(c.above()).isAir()
-                        && world.getBlockState(c.below()).isSolid()) {
-                    return c;
-                }
-            }
-            return null;
-        }
-
-        // Overworld and End: heightmap is safe to call on any column.
-        int y = world.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
-        if (y <= 0) return null;
-        BlockPos candidate = new BlockPos(x, y, z);
-        // Verify the block below is actually solid on its top face before landing on it.
-        if (!world.getBlockState(candidate.below()).isFaceSturdy(
-                world, candidate.below(), net.minecraft.core.Direction.UP)) return null;
-        return candidate;
-    }
-
-    /** Records a used position, evicting the oldest entry when the cap is reached. */
-    private static void recordUsedPosition(BlockPos pos) {
-        usedPositions.add(pos);
-        usedPositionsOrder.addLast(pos);
-        if (usedPositionsOrder.size() > USED_POSITIONS_CAP) {
-            BlockPos oldest = usedPositionsOrder.pollFirst();
-            if (oldest != null) usedPositions.remove(oldest);
-        }
-    }
-
     public static void serverStopped() {
         LOGGER.info("RTPR server stopping, shutting down scheduler.");
-        if (scheduledTask != null) {
-            scheduledTask.cancel(false);
-        }
-        if (reminderTask != null) {
-            reminderTask.cancel(false);
-        }
+        RTPRServer.revertSpawnRates();
+        cancelTasks();
         scheduler.shutdown();
         try {
             if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
@@ -563,19 +146,592 @@ public class RTPR implements ModInitializer {
         }
     }
 
-    public static void setTeleportInterval(int minutes) {
-        TELEPORT_INTERVAL = minutes;
-        if (serverInstance != null) {
-            scheduleRandomTeleport(serverInstance);
+    /** Call this from your player-disconnect event handler. */
+    public static void onPlayerDisconnect(ServerPlayer player) {
+        UUID id = player.getUUID();
+        if (preCachedPositions.remove(id) != null) {
+            LOGGER.info("Cleaned up cached position for disconnected player: {}",
+                    player.getName().getString());
         }
     }
 
+    /** Call this from your player-join event handler. */
+    public static void onPlayerJoin(MinecraftServer server, ServerPlayer player) {
+        if (!enabled) return;
+        if (scheduledTask == null || scheduledTask.isCancelled()) return;
+
+        long delay = scheduledTask.getDelay(TimeUnit.SECONDS);
+        if (delay <= 0) return;
+
+        long secsUntil = Math.max(0, delay - Config.countdownSeconds);
+        if (secsUntil <= 0) return;
+
+        String timeStr = secsUntil >= 60
+                ? (secsUntil / 60) + "m " + (secsUntil % 60) + "s"
+                : secsUntil + "s";
+
+        player.sendSystemMessage(
+                Component.literal("Next random teleport in " + timeStr + ".")
+                        .withStyle(ChatFormatting.GRAY));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Scheduling
+    // ---------------------------------------------------------------------------
+    public static void scheduleRandomTeleport(MinecraftServer server) {
+        cancelTasks();
+
+        long intervalSeconds = (long) Config.teleportIntervalMinutes * 60L;
+        long initialDelay    = Math.max(0, intervalSeconds - Config.countdownSeconds);
+
+        final AtomicLong nextTeleportAt =
+                new AtomicLong(System.currentTimeMillis() + initialDelay * 1_000L);
+
+        scheduledTask = scheduler.scheduleAtFixedRate(() -> {
+            if (!enabled || server == null) return;
+            nextTeleportAt.set(System.currentTimeMillis() + intervalSeconds * 1_000L);
+            LOGGER.info("Starting countdown for all players.");
+            server.getPlayerList().getPlayers()
+                  .forEach(player -> startCountdown(server, player, Config.countdownSeconds));
+        }, initialDelay, intervalSeconds, TimeUnit.SECONDS);
+
+        reminderTask = scheduler.scheduleAtFixedRate(() -> {
+            if (!enabled || server == null) return;
+            long secsUntil = Math.max(0,
+                    (nextTeleportAt.get() - System.currentTimeMillis()) / 1_000L);
+            if (secsUntil <= Config.countdownSeconds) return;
+
+            String timeStr = secsUntil >= 60
+                    ? (secsUntil / 60) + "m " + (secsUntil % 60) + "s"
+                    : secsUntil + "s";
+
+            server.execute(() ->
+                server.getPlayerList().getPlayers().forEach(player -> {
+                    GameType gm = player.gameMode.getGameModeForPlayer();
+                    if (gm == GameType.SPECTATOR || gm == GameType.CREATIVE) return;
+                    player.connection.send(
+                        new net.minecraft.network.protocol.game.ClientboundSetActionBarTextPacket(
+                            Component.literal("Next teleport in " + timeStr)
+                                     .withStyle(ChatFormatting.GRAY)));
+                })
+            );
+        }, Config.reminderIntervalSeconds, Config.reminderIntervalSeconds, TimeUnit.SECONDS);
+    }
+
+    private static void cancelTasks() {
+        if (scheduledTask != null && !scheduledTask.isCancelled()) scheduledTask.cancel(false);
+        if (reminderTask  != null && !reminderTask.isCancelled())  reminderTask.cancel(false);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Countdown & teleport
+    // ---------------------------------------------------------------------------
+    public static void startCountdown(MinecraftServer server, ServerPlayer player, int seconds) {
+        // Pre-cache a position immediately — the countdown window gives plenty of time.
+        scheduler.execute(() -> {
+            ServerLevel world = player.serverLevel();
+            if (world == null) return;
+            BlockPos pos = findSafeRandomPosition(world, player.blockPosition());
+            if (pos != null) {
+                preCachedPositions.put(player.getUUID(),
+                        new CachedPosition(pos, world.dimension()));
+                LOGGER.info("Pre-cached position for {}: {}", player.getName().getString(), pos);
+            } else {
+                LOGGER.warn("Pre-cache failed for {} — will retry at teleport time.",
+                        player.getName().getString());
+            }
+        });
+
+        for (int i = seconds; i >= 0; i--) {
+            final int timeLeft = i;
+            scheduler.schedule(() -> server.execute(() -> {
+                if (!player.isAlive()) return;
+                GameType gm = player.gameMode.getGameModeForPlayer();
+                if (gm == GameType.SPECTATOR || gm == GameType.CREATIVE) return;
+
+                if (timeLeft == 0) {
+                    doTeleport(server, player);
+                } else {
+                    player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetTitleTextPacket(
+                            Component.literal(" ")));
+                    player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetSubtitleTextPacket(
+                            Component.literal("Teleporting in " + timeLeft + "s")
+                                    .withStyle(timeLeft <= 5 ? ChatFormatting.RED : ChatFormatting.YELLOW)));
+                    player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetTitlesAnimationPacket(0, 25, 5));
+
+                    if (timeLeft <= 5) {
+                        player.connection.send(new net.minecraft.network.protocol.game.ClientboundSoundPacket(
+                            net.minecraft.core.Holder.direct(net.minecraft.sounds.SoundEvents.NOTE_BLOCK_PLING.value()),
+                            net.minecraft.sounds.SoundSource.MASTER,
+                            player.getX(), player.getY(), player.getZ(),
+                            1.0f, 1.5f, player.level().random.nextLong()));
+                    }
+                }
+            }), (long)(seconds - timeLeft), TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Returns true if the player has taken damage from any source (mob or player)
+     * within the combat cooldown window.
+     */
+    private static boolean isInCombat(ServerPlayer player) {
+        long gameTime      = player.level().getGameTime();
+        long cooldownTicks = Config.combatCooldownSeconds * 20L;
+        long lastMob       = player.getLastHurtByMobTimestamp();
+        long lastPlayer    = player.getLastHurtByPlayerTime();
+        long lastHurt      = Math.max(lastMob, lastPlayer);
+        return (gameTime - lastHurt) < cooldownTicks;
+    }
+
+    public static void doTeleport(MinecraftServer server, ServerPlayer player) {
+        ServerLevel world = player.serverLevel();
+        if (world == null) {
+            LOGGER.warn("Player {} has a null world, cannot teleport.", player.getName().getString());
+            return;
+        }
+
+        CachedPosition cached = preCachedPositions.get(player.getUUID());
+
+        // Discard cache if the player changed dimension during the countdown.
+        if (cached != null && !cached.dimension().equals(world.dimension())) {
+            LOGGER.info("Player {} changed dimension — discarding cached position.",
+                    player.getName().getString());
+            preCachedPositions.remove(player.getUUID());
+            cached = null;
+        }
+
+        if (isInCombat(player)) {
+            LOGGER.info("Player {} is in combat, delaying teleport by {}s.",
+                    player.getName().getString(), Config.combatCooldownSeconds);
+            player.sendSystemMessage(
+                    Component.literal("Teleport delayed — you are in combat!")
+                             .withStyle(ChatFormatting.RED));
+            scheduler.schedule(
+                    () -> server.execute(() -> doTeleport(server, player)),
+                    Config.combatCooldownSeconds, TimeUnit.SECONDS);
+            return;
+        }
+
+        if (cached != null) preCachedPositions.remove(player.getUUID());
+
+        if (cached != null) {
+            LOGGER.info("Using cached position for {}: {}", player.getName().getString(), cached.pos());
+            executeTeleport(world, player, cached.pos());
+        } else {
+            player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetTitleTextPacket(
+                    Component.literal(" ")));
+            player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetSubtitleTextPacket(
+                    Component.literal("Searching for location...").withStyle(ChatFormatting.GRAY)));
+            player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetTitlesAnimationPacket(0, 60, 10));
+
+            scheduler.execute(() -> {
+                try {
+                    BlockPos pos = findSafeRandomPosition(world, player.blockPosition());
+                    server.execute(() -> {
+                        if (pos != null) {
+                            executeTeleport(world, player, pos);
+                        } else {
+                            player.sendSystemMessage(
+                                    Component.literal("Could not find a safe teleport destination.")
+                                             .withStyle(ChatFormatting.RED));
+                            player.connection.send(
+                                    new net.minecraft.network.protocol.game.ClientboundClearTitlesPacket(true));
+                        }
+                    });
+                } catch (Exception e) {
+                    LOGGER.error("Failed to find fallback teleport position: ", e);
+                }
+            });
+        }
+    }
+
+    private static void executeTeleport(ServerLevel world, ServerPlayer player, BlockPos pos) {
+        try {
+            player.teleportTo(world, pos.getX(), pos.getY(), pos.getZ(),
+                    java.util.Set.of(), player.getYRot(), player.getXRot(), true);
+            player.sendSystemMessage(
+                    Component.literal("You have been randomly teleported!")
+                             .withStyle(ChatFormatting.GREEN));
+            player.connection.send(
+                    new net.minecraft.network.protocol.game.ClientboundClearTitlesPacket(true));
+            player.connection.send(new net.minecraft.network.protocol.game.ClientboundSoundPacket(
+                net.minecraft.core.Holder.direct(net.minecraft.sounds.SoundEvents.ENDERMAN_TELEPORT),
+                net.minecraft.sounds.SoundSource.MASTER,
+                pos.getX(), pos.getY(), pos.getZ(),
+                1.0f, 1.0f, ThreadLocalRandom.current().nextLong()));
+            spawnLootChest(world, pos, player);
+            LOGGER.info("Teleported {} to {}", player.getName().getString(), pos);
+        } catch (Exception e) {
+            LOGGER.error("Teleportation error for {}: ", player.getName().getString(), e);
+            player.sendSystemMessage(
+                    Component.literal("Teleportation failed. See server logs.")
+                             .withStyle(ChatFormatting.RED));
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Loot chest
+    // ---------------------------------------------------------------------------
+    private static void spawnLootChest(ServerLevel world, BlockPos playerPos, ServerPlayer player) {
+        try {
+            ThreadLocalRandom rng   = ThreadLocalRandom.current();
+            boolean isOp            = rng.nextInt(Config.opChestChance) == 0;
+            ResourceLocation[] pool = isOp ? OP_LOOT_TABLES : LOOT_TABLES;
+            ResourceLocation lootTable = pool[rng.nextInt(pool.length)];
+
+            net.minecraft.world.level.block.state.BlockState chestBlock = isOp
+                    ? Blocks.TRAPPED_CHEST.defaultBlockState()
+                    : Blocks.CHEST.defaultBlockState();
+
+            BlockPos chestPos = findChestPlacement(world, playerPos);
+            if (chestPos == null) {
+                LOGGER.warn("Could not find a valid chest placement near {}", playerPos);
+                return;
+            }
+
+            world.setBlock(chestPos, chestBlock, 3);
+
+            if (world.getBlockEntity(chestPos) instanceof RandomizableContainerBlockEntity chest) {
+                ResourceKey<net.minecraft.world.level.storage.loot.LootTable> key =
+                        ResourceKey.create(Registries.LOOT_TABLE, lootTable);
+                chest.setLootTable(key, rng.nextLong());
+                LOGGER.info("Spawned {} chest at {} ({})",
+                        isOp ? "OP" : "normal", chestPos, lootTable);
+            }
+
+            if (isOp) {
+                player.sendSystemMessage(
+                        Component.literal("✦ You got lucky — an OP chest spawned!")
+                                 .withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD));
+            }
+        } catch (Exception e) {
+            LOGGER.error("Failed to spawn loot chest: ", e);
+        }
+    }
+
+    /**
+     * Finds a safe adjacent block for chest placement.
+     * Skips liquid positions to avoid underwater or lava chests.
+     * Returns null if no valid position is found.
+     */
+    private static BlockPos findChestPlacement(ServerLevel world, BlockPos playerPos) {
+        BlockPos[] candidates = {
+            playerPos.north(), playerPos.south(),
+            playerPos.east(),  playerPos.west(),
+            playerPos.above()
+        };
+        for (BlockPos candidate : candidates) {
+            var state = world.getBlockState(candidate);
+            if (state.isAir()) return candidate;
+            if (state.canBeReplaced() && !state.getFluidState().isSource()) return candidate;
+        }
+        return null;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Position finding
+    // ---------------------------------------------------------------------------
+
+    /** Samples a point in a ring of radius [minDist, maxDist] around {@code origin}. */
+    private static long[] sampleRing(BlockPos origin, double minDist, double maxDist,
+                                      long maxCoord, ThreadLocalRandom rng) {
+        double angle = rng.nextDouble() * 2 * Math.PI;
+        double dist  = minDist + rng.nextDouble() * (maxDist - minDist);
+        long x = Math.max(-maxCoord, Math.min(maxCoord, (long)(origin.getX() + dist * Math.cos(angle))));
+        long z = Math.max(-maxCoord, Math.min(maxCoord, (long)(origin.getZ() + dist * Math.sin(angle))));
+        return new long[]{ x, z };
+    }
+
+    private static BlockPos findSafeRandomPosition(ServerLevel world, BlockPos playerPos) {
+        final long maxCoord    = Config.teleportRadius;
+        final boolean isNether = world.dimension().equals(net.minecraft.world.level.Level.NETHER);
+        final boolean isEnd    = world.dimension().equals(net.minecraft.world.level.Level.END);
+
+        LOGGER.info("Finding teleport position in {} (radius {})",
+                world.dimension().location(), maxCoord);
+
+        final long minDistSq       = sq(Config.minDistanceBetweenTeleports);
+        final long minOriginDistSq = sq(Config.minOriginDistance);
+        final long minPlayerDistSq = sq(Config.minPlayerDistance);
+        final ThreadLocalRandom rng = ThreadLocalRandom.current();
+
+        // The End is mostly void — give it significantly more attempts to find a
+        // solid island column.
+        int attemptsMult = isEnd ? 5 : 1;
+
+        // Pass 0 — preferred ring : 500–1000 blocks from player
+        // Pass 1 — mid ring       : 1000–5000 blocks from player
+        // Pass 2 — full radius    : anywhere beyond MIN_PLAYER_DISTANCE (skips history)
+        final int[] budgets = {
+            Config.maxTeleportAttempts * 2 * attemptsMult,
+            Config.maxTeleportAttempts     * attemptsMult,
+            Config.maxTeleportAttempts     * attemptsMult
+        };
+
+        for (int pass = 0; pass < 3; pass++) {
+            for (int i = 0; i < budgets[pass]; i++) {
+                long[] xz = switch (pass) {
+                    case 0 -> sampleRing(playerPos, Config.minPlayerDistance,
+                                         Config.maxPlayerDistance, maxCoord, rng);
+                    case 1 -> sampleRing(playerPos, Config.maxPlayerDistance,
+                                         5_000, maxCoord, rng);
+                    default -> sampleRing(playerPos, Config.minPlayerDistance,
+                                         maxCoord, maxCoord, rng);
+                };
+
+                BlockPos pos = resolveToSurface(world, (int) xz[0], (int) xz[1], isNether, isEnd);
+                if (pos == null) continue;
+                if (!passesExclusionZones(pos, playerPos, minOriginDistSq, minPlayerDistSq)) continue;
+                if (pass < 2 && usedPositions.isTooClose(pos, minDistSq)) continue;
+
+                usedPositions.record(pos);
+                LOGGER.info("Found position (pass {}) for player at {}: {}", pass, playerPos, pos);
+                return pos;
+            }
+        }
+
+        // All passes exhausted — clear history and do a final wide sweep.
+        LOGGER.warn("All passes exhausted, clearing position history and doing final sweep.");
+        usedPositions.clear();
+
+        for (int i = 0; i < Config.maxTeleportAttempts * 2 * attemptsMult; i++) {
+            double minD = Config.minPlayerDistance;
+            double maxD = (i < Config.maxTeleportAttempts) ? Config.maxPlayerDistance : maxCoord;
+            long[] xz   = sampleRing(playerPos, minD, maxD, maxCoord, rng);
+
+            if (!passesExclusionZones(
+                    new BlockPos((int) xz[0], 0, (int) xz[1]),
+                    playerPos, minOriginDistSq, minPlayerDistSq)) continue;
+
+            BlockPos pos = resolveToSurface(world, (int) xz[0], (int) xz[1], isNether, isEnd);
+            if (pos == null) continue;
+
+            LOGGER.warn("Final sweep found position: {}", pos);
+            return pos;
+        }
+
+        // End-specific last resort -- do a dedicated outer-island spiral search.
+        // Outer End islands spawn in a ring roughly 1000-20000 blocks from origin
+        // on a fixed noise pattern, so we sample that ring explicitly and force-load
+        // chunks so block data is actually available.
+        if (isEnd) {
+            LOGGER.warn("End dimension fallback: scanning outer island ring.");
+            BlockPos islandPos = findEndIsland(world, rng, maxCoord);
+            if (islandPos != null) {
+                LOGGER.warn("End island fallback found position: {}", islandPos);
+                return islandPos;
+            }
+        }
+
+        LOGGER.error("All position search attempts failed.");
+        return null;
+    }
+
+    /**
+     * Dedicated outer End island finder.
+     *
+     * End outer islands generate on a noise grid with islands appearing roughly
+     * every 100 blocks in a ring between 1000 and 20000 blocks from the origin.
+     * This method samples that ring, force-loads each candidate chunk so block
+     * data is available, then does a full column scan to confirm solid ground.
+     *
+     * Force-loading is done via world.getChunk() with a FULL chunk status, which
+     * is safe to call off the main thread during position pre-caching.
+     */
+    private static BlockPos findEndIsland(ServerLevel world, ThreadLocalRandom rng, long maxCoord) {
+        // Islands appear reliably between 1000 and 20000 blocks out.
+        final double MIN_ISLAND_DIST = 1_000;
+        final double MAX_ISLAND_DIST = Math.min(20_000, maxCoord);
+        final int ISLAND_ATTEMPTS    = 200;
+
+        for (int i = 0; i < ISLAND_ATTEMPTS; i++) {
+            double angle = rng.nextDouble() * 2 * Math.PI;
+            double dist  = MIN_ISLAND_DIST + rng.nextDouble() * (MAX_ISLAND_DIST - MIN_ISLAND_DIST);
+            int cx = (int)(dist * Math.cos(angle));
+            int cz = (int)(dist * Math.sin(angle));
+
+            // Snap to the nearest 16-block chunk boundary to improve hit rate --
+            // End islands tend to be chunk-aligned due to the noise generator.
+            cx = (cx >> 4) << 4;
+            cz = (cz >> 4) << 4;
+
+            // Force-load the chunk so getBlockState calls return real data.
+            // getChunk with FULL status generates the chunk if not already present.
+            try {
+                world.getChunk(cx >> 4, cz >> 4,
+                        net.minecraft.world.level.chunk.status.ChunkStatus.FULL, true);
+            } catch (Exception e) {
+                LOGGER.debug("Could not load End chunk at ({}, {}): {}", cx >> 4, cz >> 4, e.getMessage());
+                continue;
+            }
+
+            // Scan a small local area around the sampled point to find a solid column.
+            for (int dx = 0; dx < 16; dx++) {
+                for (int dz = 0; dz < 16; dz++) {
+                    int sx = cx + dx;
+                    int sz = cz + dz;
+
+                    int y = world.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, sx, sz);
+                    if (y <= world.getMinY()) continue;
+
+                    // Top-down scan to find the actual solid surface.
+                    boolean hasSolid = false;
+                    for (int scanY = y; scanY > world.getMinY(); scanY--) {
+                        if (world.getBlockState(new BlockPos(sx, scanY, sz)).isCollisionShapeFullBlock(world, new BlockPos(sx, scanY, sz))) {
+                            y = scanY + 1;
+                            hasSolid = true;
+                            break;
+                        }
+                    }
+                    if (!hasSolid) continue;
+
+                    BlockPos candidate = new BlockPos(sx, y, sz);
+
+                    // Verify sturdy floor and standing room.
+                    if (!world.getBlockState(candidate.below()).isFaceSturdy(
+                            world, candidate.below(), net.minecraft.core.Direction.UP)) continue;
+                    if (world.getBlockState(candidate).isCollisionShapeFullBlock(world, candidate))        continue;
+                    if (world.getBlockState(candidate.above()).isCollisionShapeFullBlock(world, candidate.above())) continue;
+
+                    return candidate;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Returns true if {@code pos} clears both the origin and player exclusion zones. */
+    private static boolean passesExclusionZones(BlockPos pos, BlockPos playerPos,
+                                                 long minOriginDistSq, long minPlayerDistSq) {
+        long ox = pos.getX(), oz = pos.getZ();
+        if (ox * ox + oz * oz < minOriginDistSq) return false;
+        long pdx = pos.getX() - playerPos.getX();
+        long pdz = pos.getZ() - playerPos.getZ();
+        return pdx * pdx + pdz * pdz >= minPlayerDistSq;
+    }
+
+    /**
+     * Resolves an (x, z) coordinate to a safe standing position.
+     *
+     * Overworld / End:
+     *   Uses MOTION_BLOCKING_NO_LEAVES heightmap to find the surface Y.
+     *   Returns null if:
+     *     - The heightmap returns a value at or below min build height (void column).
+     *     - [End only] A top-down scan finds no solid block in the column.
+     *     - The block below the surface isn't sturdy on its top face.
+     *     - The landing spot or block above it is solid (no room to stand).
+     *
+     * Nether:
+     *   Scans upward from Y=30 to Y=110 for an air gap with a solid floor.
+     *   Only processes already-loaded chunks to stay thread-safe.
+     */
+    private static BlockPos resolveToSurface(ServerLevel world, int x, int z,
+                                              boolean isNether, boolean isEnd) {
+        if (isNether) {
+            if (!world.hasChunk(x >> 4, z >> 4)) return null;
+            for (int y = 30; y < 110; y++) {
+                BlockPos c = new BlockPos(x, y, z);
+                if (world.getBlockState(c).isAir()
+                        && world.getBlockState(c.above()).isAir()
+                        && world.getBlockState(c.below()).isCollisionShapeFullBlock(world, c.below())) {
+                    return c;
+                }
+            }
+            return null;
+        }
+
+        // --- Overworld and End ---
+        int y = world.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+
+        // A heightmap result at or below min build height means the column is void.
+        if (y <= world.getMinY()) return null;
+
+        // End-specific: do a top-down scan to confirm there is actually a solid block
+        // in this column. The heightmap can return a low but non-zero value even over
+        // void if only air or non-blocking blocks are present.
+        if (isEnd) {
+            boolean hasSolid = false;
+            for (int scanY = y; scanY > world.getMinY(); scanY--) {
+                if (world.getBlockState(new BlockPos(x, scanY, z)).isCollisionShapeFullBlock(world, new BlockPos(x, scanY, z))) {
+                    hasSolid = true;
+                    y = scanY + 1; // stand on top of the confirmed solid block
+                    break;
+                }
+            }
+            // No solid block found in the column — this is void, reject it.
+            if (!hasSolid) return null;
+        }
+
+        BlockPos candidate = new BlockPos(x, y, z);
+
+        // The block directly below must be sturdy so the player won't fall through.
+        if (!world.getBlockState(candidate.below()).isFaceSturdy(
+                world, candidate.below(), net.minecraft.core.Direction.UP)) return null;
+
+        // The landing spot and the block above must not be solid — player needs room to stand.
+        if (world.getBlockState(candidate).isCollisionShapeFullBlock(world, candidate))        return null;
+        if (world.getBlockState(candidate.above()).isCollisionShapeFullBlock(world, candidate.above())) return null;
+
+        return candidate;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Commands API
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Forces an OP loot chest to spawn at the player's current position.
+     * Called by /rtpr opchest <player>. Runs on the server thread via server.execute().
+     */
+    public static void spawnOpChestAt(net.minecraft.server.MinecraftServer server, ServerPlayer player) {
+        server.execute(() -> {
+            try {
+                ServerLevel world = player.serverLevel();
+                BlockPos chestPos = findChestPlacement(world, player.blockPosition());
+                if (chestPos == null) {
+                    player.sendSystemMessage(
+                            Component.literal("No space found to place the OP chest.")
+                                     .withStyle(ChatFormatting.RED));
+                    LOGGER.warn("spawnOpChestAt: no valid placement near {}", player.blockPosition());
+                    return;
+                }
+
+                world.setBlock(chestPos, net.minecraft.world.level.block.Blocks.TRAPPED_CHEST.defaultBlockState(), 3);
+
+                if (world.getBlockEntity(chestPos) instanceof net.minecraft.world.level.block.entity.RandomizableContainerBlockEntity chest) {
+                    ResourceLocation lootTable = OP_LOOT_TABLES[ThreadLocalRandom.current().nextInt(OP_LOOT_TABLES.length)];
+                    ResourceKey<net.minecraft.world.level.storage.loot.LootTable> key =
+                            ResourceKey.create(Registries.LOOT_TABLE, lootTable);
+                    chest.setLootTable(key, ThreadLocalRandom.current().nextLong());
+                    LOGGER.info("spawnOpChestAt: spawned OP chest at {} for {}", chestPos, player.getName().getString());
+                }
+
+                player.sendSystemMessage(
+                        Component.literal("An OP chest has been granted to you!")
+                                 .withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD));
+            } catch (Exception e) {
+                LOGGER.error("spawnOpChestAt failed for {}: ", player.getName().getString(), e);
+            }
+        });
+    }
+
+    public static void setTeleportInterval(int minutes) {
+        Config.teleportIntervalMinutes = minutes;
+        if (serverInstance != null) scheduleRandomTeleport(serverInstance);
+    }
+
     public static void setTeleportRadius(int blocks) {
-        TELEPORT_RADIUS = blocks;
+        Config.teleportRadius = blocks;
     }
 
     public static boolean toggleEnabled() {
         enabled = !enabled;
         return enabled;
     }
+
+    // ---------------------------------------------------------------------------
+    // Utility
+    // ---------------------------------------------------------------------------
+    private static long sq(long v) { return v * v; }
 }

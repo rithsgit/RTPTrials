@@ -1,7 +1,6 @@
 package com.example;
 
 import com.mojang.brigadier.arguments.IntegerArgumentType;
-import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
@@ -47,6 +46,15 @@ public class RTPRCommands {
                                 ctx.getSource(),
                                 EntityArgument.getPlayers(ctx, "player")
                             ))))
+
+                    // /rtpr opchest <player>
+                    // Forces an OP loot chest to spawn at the target player's current position.
+                    .then(Commands.literal("opchest")
+                        .then(Commands.argument("player", EntityArgument.players())
+                            .executes(ctx -> executeOpChest(
+                                ctx.getSource(),
+                                EntityArgument.getPlayers(ctx, "player")
+                            ))))
             );
         });
     }
@@ -84,6 +92,18 @@ public class RTPRCommands {
                 "Triggered teleport countdown for " + player.getName().getString() + ".")
                 .withStyle(ChatFormatting.GREEN), true);
             RTPR.LOGGER.info("{} manually triggered teleport for {}",
+                source.getTextName(), player.getName().getString());
+        }
+        return players.size();
+    }
+
+    private static int executeOpChest(CommandSourceStack source, Collection<ServerPlayer> players) {
+        for (ServerPlayer player : players) {
+            RTPR.spawnOpChestAt(source.getServer(), player);
+            source.sendSuccess(() -> Component.literal(
+                "Spawned OP chest for " + player.getName().getString() + ".")
+                .withStyle(ChatFormatting.GOLD), true);
+            RTPR.LOGGER.info("{} manually spawned OP chest for {}",
                 source.getTextName(), player.getName().getString());
         }
         return players.size();
