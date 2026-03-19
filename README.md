@@ -1,6 +1,6 @@
 # RTPTrials
 
-A Fabric mod for Minecraft 1.21.4 that periodically teleports players to random locations across the world, turning every session into a survival challenge. Land somewhere unknown, fight boosted mobs, and loot the chest that spawns on arrival — with a rare chance of striking it lucky with OP gear.
+A Fabric mod for Minecraft 1.21.4 // 1.21.11 that periodically teleports players to random locations across the world, turning every session into a survival challenge. Land somewhere unknown, fight boosted mobs, and loot the chest that spawns on arrival — with a rare chance of striking it lucky with OP gear.
 
 ---
 
